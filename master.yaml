@@ -1,0 +1,249 @@
+#cloud-config
+
+---
+write-files:
+  - path: /etc/conf.d/nfs
+    permissions: '0644'
+    content: |
+      OPTS_RPC_MOUNTD=""
+  - path: /opt/bin/wupiao
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+      [ -n "$1" ] && \
+        until curl -o /dev/null -sIf http://${1}; do \
+          sleep 1 && echo .;
+        done;
+      exit $?
+  - path: /opt/bin/midonet-cli
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      #
+      # Adapter for using midonet-cli from midonet/utils
+      #
+      CLUSTER_IP=$(docker inspect \
+          --format '{{ .NetworkSettings.IPAddress }}' cluster)
+
+      if [ $? -eq 0 ]; then
+          docker run --rm \
+            -e CLUSTER_URL="http://$CLUSTER_IP:8181/midonet-api" \
+            midonet/utils cli "$@"
+      else
+          echo "Failed to find the Cluster container"
+          exit 1
+      fi
+  - path: /opt/bin/mn-conf
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      #
+      # Adapter for using mn-conf from midonet/utils
+      #
+      ZK_ENDPOINTS=""
+
+      for cid in $(docker ps | grep zookeeper | awk '{print $1}'); do
+          if [ "$ZK_ENDPOINTS" = "" ]; then
+              ZK_ENDPOINTS="$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' $cid):2181";
+          else
+              ZK_ENDPOINTS="$ZK_ENDPOINTS,$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' $cid):2181";
+          fi
+      done
+
+      if [ "$ZK_ENDPOINTS" = "" ]; then
+          echo "Failed to find the Zookeeper containers"
+          exit 1
+      else
+          docker run -ti --rm  -e ZK_ENDPOINTS=$ZK_ENDPOINTS midonet/utils \
+            conf "$@"
+      fi
+
+  - path: /opt/bin/mhr
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # [m]idonet [h]ost [r]egistrar
+      HOST_UUID=$(basename "$ETCD_WATCH_KEY")
+      BIND_ADDR=$ETCD_WATCH_VALUE
+      DEFAULT_TZ=$(/opt/bin/midonet-cli -e tunnel-zone list | \
+        grep "name default " | awk '{print $2}')
+
+      # Delete the member if it already exists
+      /opt/bin/midonet-cli -e tunnel-zone "$DEFAULT_TZ" member list | grep -q \
+        "host $HOST_UUID" && midonet-cli -e tunnel-zone "$DEFAULT_TZ"  delete \
+        member host "$HOST_UUID"
+
+      # Add member to the default tunnel zone
+      /opt/bin/midonet-cli -e tunnel-zone "$DEFAULT_TZ" add member \
+        host "$HOST_UUID" address "$BIND_ADDR"
+
+hostname: master
+coreos:
+  etcd2:
+    name: master
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+    initial-cluster-token: k8s_etcd
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    initial-cluster: master=http://$private_ipv4:2380
+    initial-cluster-state: new
+  fleet:
+    metadata: "role=master"
+  units:
+    - name: etcd2.service
+      command: start
+    - name: generate-serviceaccount-key.service
+      command: start
+      content: |
+        [Unit]
+        Description=Generate service-account key file
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStart=/bin/openssl genrsa -out /opt/bin/kube-serviceaccount.key 2048 2>/dev/null
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: zookeeper.service
+      command: start
+      content: |
+        [Unit]
+        Description=Apache Zookeeper
+        Requires=After=network-online.target
+        After=docker.service
+        After=etcd2.service
+
+        [Service]
+        ExecStart=/usr/bin/docker run -d \
+          --name zookeeper \
+          -p 2181:2181 \
+          jplock/zookeeper
+    - name: midonet-cluster.service
+      command: start
+      content: |
+        [Unit]
+        Description=MidoNet Cluster
+        Documentation=https://docs.midonet.org/docs/latest/operations-guide/content/_configuration_sources.html
+        Requires=zookeeper.service
+        After=network-online.target
+        After=docker.service
+        After=Zookeeper.service
+
+        [Service]
+        ExecStartPre=/opt/bin/wupiao 127.0.0.1 2181
+        ExecStart=docker run -d --name cluster \
+          -e ZK_ENDPOINTS=172.17.0.83:2181,172.17.0.83:2181,172.17.0.85:2182 \
+          -e KEYSTONE_HOST=172.17.0.81 \
+          -e KEYSTONE_PORT=35357 \
+          -e KEYSTONE_ADMIN_TOKEN="ADMIN" \
+          -e UUID="a293fed0-f7dc-40e6-b01d-c688cfa02429" \
+          -v /var/log/midonet-cluster:/var/log/midonet-cluster \
+            midonet/cluster
+
+    - name: setup-network-environment.service
+      command: start
+      content: |
+        [Unit]
+        Description=Setup Network Environment
+        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Requires=network-online.target
+        After=network-online.target
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
+        ExecStart=/opt/bin/setup-network-environment
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: fleet.service
+      command: start
+    - name: flanneld.service
+      command: start
+      drop-ins:
+        - name: 50-network-config.conf
+          content: |
+            [Unit]
+            Requires=etcd2.service
+            [Service]
+            ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.244.0.0/16", "Backend": {"Type": "vxlan"}}'
+    - name: docker.service
+      command: start
+    - name: kube-apiserver.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes API Server
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=setup-network-environment.service etcd2.service generate-serviceaccount-key.service
+        After=setup-network-environment.service etcd2.service generate-serviceaccount-key.service
+
+        [Service]
+        EnvironmentFile=/etc/network-environment
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-apiserver -z /opt/bin/kube-apiserver https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kube-apiserver
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-apiserver
+        ExecStartPre=/opt/bin/wupiao 127.0.0.1:2379/v2/machines
+        ExecStart=/opt/bin/kube-apiserver \
+        --service-account-key-file=/opt/bin/kube-serviceaccount.key \
+        --service-account-lookup=false \
+        --admission-control=NamespaceLifecycle,NamespaceAutoProvision,LimitRanger,SecurityContextDeny,ServiceAccount,ResourceQuota \
+        --runtime-config=api/v1 \
+        --allow-privileged=true \
+        --insecure-bind-address=0.0.0.0 \
+        --insecure-port=8080 \
+        --kubelet-https=true \
+        --secure-port=6443 \
+        --service-cluster-ip-range=10.100.0.0/16 \
+        --etcd-servers=http://127.0.0.1:2379 \
+        --public-address-override=${DEFAULT_IPV4} \
+        --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-controller-manager.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Controller Manager
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-controller-manager -z /opt/bin/kube-controller-manager https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kube-controller-manager
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-controller-manager
+        ExecStart=/opt/bin/kube-controller-manager \
+        --service-account-private-key-file=/opt/bin/kube-serviceaccount.key \
+        --master=127.0.0.1:8080 \
+        --logtostderr=true
+        Restart=always
+        RestartSec=10
+    - name: kube-scheduler.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Scheduler
+        Documentation=https://github.com/kubernetes/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-scheduler -z /opt/bin/kube-scheduler https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kube-scheduler
+        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-scheduler
+        ExecStart=/opt/bin/kube-scheduler --master=127.0.0.1:8080
+        Restart=always
+        RestartSec=10
+  update:
+    group: alpha
+    reboot-strategy: off
+ssh_authorized_keys:
+  # include one or more SSH public keys
+  - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDtFpjCFxh6g70V6tEtBHJUBWKl6U6BLiqnjRZhCPXmYmx0mxOmmVSt5yCz9SEmFiQA5DrOl/EbGRofI/kILiigWMWEo2sf3QLMNQKIHU/QCYa99BtTTgAe+/+dL5ztJjU4lzNQAXEkDt0pbpvt1c5XsuqfShyf7T68RpK4r8pJ5IlmdvhzdAyZiOCxAjC7ftPSzTqyAiRm1tHZWUptmkncla/W5gDw213NCXsEmqJA8rJTgR6UqF6wN97qDlwTyfjKDoMzaEoLCB7AEXHwK5WJwUtgRs8ZOkQxwToDA+It9J7dt2MNAxnVlfa6D4ag/t6mz/8/MXO6BhW7Z+Nwk4+H0CnW9St+pmdHoc0m4s1nuxTHKGz/L8P/cxHtN26fgc3u4/Zg1lA2g44JzfTQDDXoXuYuvkpXn8hnErXkD3gcX8R8f8z2F6bH8srXsSL2KZMPr8u0wxd+QU9bC9U5wZKhD/i5ct2+BCYcjuEbKt9EFssZqgefuh+L9YHxip7YWCIyKbkXhn/mF++Viq2i8XR11rWp/xWYti2oIVZc5BgiKkSPalnfkXS9riqd8+76QlpkOnv2ocyOSlgLD9WqCg4DwYGMZtS5YH5S8h6L52ahNUSsd+AiN0CmBC7N3vTFoi1sIDZKXgGXmlUAXZJqt23diGh6s2zSrpcOSMjq6e6Cww== celebdor@nx02"
+users:
+  - name: "celebdor"
+    groups:
+      - "sudo"
+      - "docker"
+    ssh-authorized-keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDtFpjCFxh6g70V6tEtBHJUBWKl6U6BLiqnjRZhCPXmYmx0mxOmmVSt5yCz9SEmFiQA5DrOl/EbGRofI/kILiigWMWEo2sf3QLMNQKIHU/QCYa99BtTTgAe+/+dL5ztJjU4lzNQAXEkDt0pbpvt1c5XsuqfShyf7T68RpK4r8pJ5IlmdvhzdAyZiOCxAjC7ftPSzTqyAiRm1tHZWUptmkncla/W5gDw213NCXsEmqJA8rJTgR6UqF6wN97qDlwTyfjKDoMzaEoLCB7AEXHwK5WJwUtgRs8ZOkQxwToDA+It9J7dt2MNAxnVlfa6D4ag/t6mz/8/MXO6BhW7Z+Nwk4+H0CnW9St+pmdHoc0m4s1nuxTHKGz/L8P/cxHtN26fgc3u4/Zg1lA2g44JzfTQDDXoXuYuvkpXn8hnErXkD3gcX8R8f8z2F6bH8srXsSL2KZMPr8u0wxd+QU9bC9U5wZKhD/i5ct2+BCYcjuEbKt9EFssZqgefuh+L9YHxip7YWCIyKbkXhn/mF++Viq2i8XR11rWp/xWYti2oIVZc5BgiKkSPalnfkXS9riqd8+76QlpkOnv2ocyOSlgLD9WqCg4DwYGMZtS5YH5S8h6L52ahNUSsd+AiN0CmBC7N3vTFoi1sIDZKXgGXmlUAXZJqt23diGh6s2zSrpcOSMjq6e6Cww== celebdor@nx02"
