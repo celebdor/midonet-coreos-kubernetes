@@ -6,6 +6,17 @@ write-files:
     permissions: '0644'
     content: |
       OPTS_RPC_MOUNTD=""
+  - path: /etc/conf.d/midonet
+    permissions: '0644'
+    content: |
+      MIDONET_UUID="a293fed0-f7dc-40e6-b01d-c688cfa02429"
+      KEYSTONE_HOST="172.17.0.81"
+      KEYSTONE_PORT="35357"
+      KEYSTONE_PROJECT="admin"
+      KEYSTONE_USERNAME="admin"
+      KEYSTONE_PASSWORD="admin"
+      KEYSTONE_ADMIN_TOKEN="ADMIN"
+      NEUTRON_URL=http://127.0.0.1:9696
   - path: /opt/bin/wupiao
     permissions: '0755'
     content: |
@@ -115,10 +126,13 @@ coreos:
         After=etcd2.service
 
         [Service]
+        ExecStartPre=-/usr/bin/etcdctl mkdir /zookeeper
         ExecStart=/usr/bin/docker run -d \
           --name zookeeper \
           -p 2181:2181 \
           jplock/zookeeper
+        ExecStartPost=/usr/bin/etcdctl set \
+          /zookeeper/1 $private_ipv4
     - name: midonet-cluster.service
       command: start
       content: |
@@ -131,43 +145,39 @@ coreos:
         After=Zookeeper.service
 
         [Service]
+        Restart=always
+        EnvironmentFile=/etc/conf.d/midonet
+        ExecStartPre=/usr/bin/docker pull midonet/cluster
         ExecStartPre=/opt/bin/wupiao 127.0.0.1 2181
-        ExecStart=docker run -d --name cluster \
-          -e ZK_ENDPOINTS=172.17.0.83:2181,172.17.0.83:2181,172.17.0.85:2182 \
-          -e KEYSTONE_HOST=172.17.0.81 \
-          -e KEYSTONE_PORT=35357 \
-          -e KEYSTONE_ADMIN_TOKEN="ADMIN" \
-          -e UUID="a293fed0-f7dc-40e6-b01d-c688cfa02429" \
+        ExecStart=/usr/bin/docker run -d --name cluster \
+          -e ZK_ENDPOINTS=$private_ipv4:2181 \
+          -e KEYSTONE_HOST=${KEYSTONE_HOST} \
+          -e KEYSTONE_PORT=${KEYSTONE_PORT} \
+          -e KEYSTONE_ADMIN_TOKEN=${KEYSTONE_ADMIN_TOKEN} \
+          -e UUID=${MIDONET_UUID} \
+          -p 8181:8181 \
           -v /var/log/midonet-cluster:/var/log/midonet-cluster \
             midonet/cluster
-
-    - name: setup-network-environment.service
+        ExecStartPost=/usr/bin/etcdctl set \
+          /midonet/cluster/${MIDONET_UUID} $private_ipv4
+        ExecStopPre=/usr/bin/docker kill cluster
+        ExecStop=/usr/bin/docker rm cluster
+        ExecStopPost=/usr/bin/etcdctl rm \
+          /midonet/cluster/${MIDONET_UUID}
+    - name: midonet-registration.service
       command: start
       content: |
         [Unit]
-        Description=Setup Network Environment
-        Documentation=https://github.com/kelseyhightower/setup-network-environment
+        Description=Automatically add new hosts to the default tunnel zone
+        Documentation=https://docs.midonet.org/docs/latest/operations-guide/content/_configuration_sources.html
         Requires=network-online.target
-        After=network-online.target
+        After=midonet-cluster.service
 
         [Service]
-        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
-        ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
-        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
-        ExecStart=/opt/bin/setup-network-environment
-        RemainAfterExit=yes
-        Type=oneshot
-    - name: fleet.service
-      command: start
-    - name: flanneld.service
-      command: start
-      drop-ins:
-        - name: 50-network-config.conf
-          content: |
-            [Unit]
-            Requires=etcd2.service
-            [Service]
-            ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.244.0.0/16", "Backend": {"Type": "vxlan"}}'
+        ExecStartPre=-/opt/bin/midonet-cli -e create tunnel-zone name default \
+          type vxlan
+        ExecStart=/usr/bin/etcdctl exec-watch --recursive /midonet/hosts -- /opt/bin/mhr
+        Restart=always
     - name: docker.service
       command: start
     - name: kube-apiserver.service
@@ -234,6 +244,29 @@ coreos:
         ExecStart=/opt/bin/kube-scheduler --master=127.0.0.1:8080
         Restart=always
         RestartSec=10
+    - name: kuryr-watcher.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kuryr Kubernetes API watcher
+        Documentation=https://github.com/midonet/kuryr/tree/k8s
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        EnvironmentFile=/etc/conf.d/midonet
+        ExecStartPre=/opt/bin/wupiao 127.0.0.1 8080
+        ExecStart=/usr/bin/docker run --name %n \
+          -e SERVICE_USER=${KEYSTONE_USERNAME} \
+          -e SERVICE_TENANT_NAME=${KEYSTONE_PROJECT} \
+          -e SERVICE_PASSWORD=${KEYSTONE_PASSWORD} \
+          -e IDENTITY_URL=http://${KEYSTONE_HOST}:35357/v2.0 \
+          -e OS_URL=${NEUTRON_URL} \
+          -e K8S_API=http://$private_ipv4:8080 \
+          -v /var/log/kuryr:/var/log/kuryr \
+         midonet/raven
+        Restart=always
+        RestartSec=3
   update:
     group: alpha
     reboot-strategy: off
