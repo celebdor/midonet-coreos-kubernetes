@@ -5,10 +5,56 @@ write-files:
     content: |
       #!/bin/bash
       # [w]ait [u]ntil [p]ort [i]s [a]ctually [o]pen
+
       [ -n "$1" ] && [ -n "$2" ] && while ! curl --output /dev/null \
         --silent --head --fail \
-        http://${1}:${2}; do sleep 1 && echo -n .; done;
+        http://${1}:${2}{3}; do sleep 1 && echo -n .; done;
       exit $?
+  - path: /opt/bin/wuziaok
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # [w]ait [u]ntil [z]ookeeper [i]s [a]ctually [o][k]
+
+      [ -n "$1" ] && [ -n "$2" ] && while ! echo ruok | \
+          ncat -w 0.1 "$1" "$2" 2> /dev/null | \
+        grep -q imok; do sleep 1 && echo -n .; done;
+      exit $?
+
+  - path: /opt/bin/midonet-env
+    permissions: '0755'
+    content: |
+      #!/bin/sh -xv
+      # [m]idonet [e]nvironment [p]reparation
+      MIDONET_CONF=/etc/conf.d/midonet
+      if [ ! -f $MIDONET_CONF ] || \
+       [ ! grep -q "MIDONET_UUID" $MIDONET_CONF ]; then
+        echo "MIDONET_UUID=$(uuidgen)" > /etc/conf.d/midonet
+      fi
+  - path: /opt/bin/mar
+    permissions: '0755'
+    content: |
+      #!/bin/sh -xv
+      # [m]idonet [a]gent [r]egistrar
+      INTERFACE="eth0"
+
+      uuid=$(grep "MIDONET_UUID=" /etc/conf.d/midonet | \
+        awk '{split($0, keyval, "="); print keyval[2]}')
+      address=$(ip -4 -o -d a show $INTERFACE | \
+        awk '{split($4, cidr, "/"); print cidr[1]}')
+
+      # Make sure the dirs exist
+      etcdctl mkdir /midonet
+      rc=$?
+      if [ $rc != 0 ] && [ $rc != 4 ]; then
+          exit $rc
+      fi
+      etcdctl mkdir /midonet/agents
+      rc=$?
+      if [ $rc != 0 ] && [ $rc != 4 ]; then
+          exit $rc
+      fi
+      etcdctl set "/midonet/agents/$uuid" "$address"
 coreos:
   etcd2:
     listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
@@ -22,45 +68,46 @@ coreos:
       command: start
     - name: fleet.service
       command: start
-    - name: flanneld.service
-      command: start
+    - name: systemd-networkd.service
+      command: restart
     - name: docker.service
       command: start
-    - name: setup-network-environment.service
+    - name: midonet-environment.service
       command: start
       content: |
         [Unit]
-        Description=Setup Network Environment
-        Documentation=https://github.com/kelseyhightower/setup-network-environment
-        Requires=network-online.target
+        Description=Set up some variables for MidoNet's Agent functions
         After=network-online.target
 
         [Service]
-        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
-        ExecStartPre=/usr/bin/curl -L -o /opt/bin/setup-network-environment -z /opt/bin/setup-network-environment https://github.com/kelseyhightower/setup-network-environment/releases/download/v1.0.0/setup-network-environment
-        ExecStartPre=/usr/bin/chmod +x /opt/bin/setup-network-environment
-        ExecStart=/opt/bin/setup-network-environment
-        RemainAfterExit=yes
         Type=oneshot
-    - name: kube-proxy.service
+        RemainAfterExit=yes
+        ExecStart=/opt/bin/midonet-env
+    - name: midonet-agent.service
       command: start
       content: |
         [Unit]
-        Description=Kubernetes Proxy
-        Documentation=https://github.com/kubernetes/kubernetes
-        Requires=setup-network-environment.service
-        After=setup-network-environment.service
+        Description=MidoNet Agent
+        Documentation=https://docs.midonet.org/docs/latest/operations-guide/content/_configuration_sources.html
+        After=network-online.target
+        After=docker.service
+        After=midonet-environment.service
 
         [Service]
-        ExecStartPre=/usr/bin/curl -L -o /opt/bin/kube-proxy -z /opt/bin/kube-proxy https://storage.googleapis.com/kubernetes-release/release/v1.1.2/bin/linux/amd64/kube-proxy
-        ExecStartPre=/usr/bin/chmod +x /opt/bin/kube-proxy
-        # wait for kubernetes master to be up and ready
-        ExecStartPre=/opt/bin/wupiao <master-private-ip> 8080
-        ExecStart=/opt/bin/kube-proxy \
-        --master=<master-private-ip>:8080 \
-        --logtostderr=true
         Restart=always
-        RestartSec=10
+        EnvironmentFile=/etc/conf.d/midonet
+        ExecStartPre=-/usr/bin/docker pull midonet/agent
+        ExecStartPre=/opt/bin/wupiao 127.0.0.1 4001 /v2/keys
+        ExecStart=/usr/bin/docker run -d --name agent --net=host \
+          --cap-add=NET_ADMIN \
+          -e ZK_ENDPOINTS=$private_ipv4:2181 \
+          -e UUID=${MIDONET_UUID} \
+          -v /var/log/midolman:/var/log/midolman \
+            midonet/agent
+        ExecStartPost=/opt/bin/mar
+        ExecStopPre=/usr/bin/docker kill agent
+        ExecStopPost=/usr/bin/etcdctl rm \
+          /midonet/agents/${MIDONET_UUID}
     - name: kube-kubelet.service
       command: start
       content: |

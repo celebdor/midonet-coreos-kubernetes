@@ -176,7 +176,7 @@ coreos:
         [Service]
         ExecStartPre=-/opt/bin/midonet-cli -e create tunnel-zone name default \
           type vxlan
-        ExecStart=/usr/bin/etcdctl exec-watch --recursive /midonet/hosts -- /opt/bin/mhr
+        ExecStart=/usr/bin/etcdctl exec-watch --recursive /midonet/agent -- /opt/bin/mhr
         Restart=always
     - name: docker.service
       command: start
